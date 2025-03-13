@@ -1,98 +1,154 @@
+import logging
+logging.basicConfig(filename='app_launch.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.info("Application starting up...")
+
+import os
+import sys
+import traceback  # Add traceback for better error logging
+
+# Conditional import of fcntl - only for non-Windows systems
+if os.name != 'nt':  # 'nt' is the os.name for Windows
+    import fcntl
+    has_fcntl = True
+else:
+    has_fcntl = False
+    fcntl = None # To avoid NameError later
+    # Import Windows-specific modules for single instance check
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
 from kivy.app import App
 from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.label import Label
-from kivy.uix.button import Button
 from kivy.uix.textinput import TextInput
 from kivy.core.window import Window
-from kivy.graphics import Color, RoundedRectangle, Line
-from kivy.uix.image import Image
+from kivy.uix.screenmanager import ScreenManager, Screen
 from kivy.lang import Builder
-from kivy.uix.scrollview import ScrollView
-from kivy.uix.gridlayout import GridLayout
-from kivy.animation import Animation
-from kivy.clock import Clock
-import os
+from kivy.uix.widget import Widget
 from dotenv import load_dotenv
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_chroma import Chroma
 from langchain.chains import ConversationalRetrievalChain
 from langchain.prompts import PromptTemplate
-from kivy.uix.dropdown import DropDown
-from kivy.uix.screenmanager import ScreenManager, Screen
-from kivy.uix.popup import Popup
-from kivy.uix.floatlayout import FloatLayout
-from kivy.uix.widget import Widget
-from threading import Thread
+import subprocess
+from pinecone import Pinecone
+from langchain_pinecone import PineconeVectorStore
+import logging
+import json
+from kivy.clock import Clock
 from functools import partial
-from user import UserManager
-from chatbot import qa_system
+import threading
+from kivy.animation import Animation  # Add this import for Animation
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.label import Label
+from kivy.uix.button import Button
+from kivy.uix.relativelayout import RelativeLayout
 
-# Add this right after the imports
+# Configure logging - update to include more detailed error logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('desktop_app.log'),
+        logging.StreamHandler()
+    ]
+)
+
+# Add a function to handle uncaught exceptions
+def handle_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        # Don't log keyboard interrupt
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    
+    logging.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+    # Display error message to user
+    from kivy.app import App
+    from kivy.uix.popup import Popup
+    from kivy.uix.label import Label
+    
+    if App.get_running_app():
+        error_msg = f"An error occurred: {exc_value}"
+        popup = Popup(title='Error',
+                    content=Label(text=error_msg),
+                    size_hint=(0.8, 0.4))
+        popup.open()
+
+# Set the exception handler
+sys.excepthook = handle_exception
+
+# Import components
+try:
+    from components.login_screen import LoginScreen
+    from components.database_select_screen import DatabaseSelectScreen
+    from components.chat_area import ChatArea
+    from components.rounded_button import RoundedButton
+except ImportError as e:
+    logging.error(f"Error importing components: {e}")
+    raise
+
+# Load environment variables
 load_dotenv()
 api_key = os.getenv('OPENAI_API_KEY')
 if not api_key:
     raise ValueError("OPENAI_API_KEY environment variable is not set")
 
-# Import and initialize ChromaConfig
-from config import ChromaConfig
+# Base directory setup
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Initialize ChromaConfig with EC2 setting from environment
-chroma_config = ChromaConfig(use_api=os.getenv('USE_API', 'false').lower() == 'true')
-VECTOR_DB_DIR = chroma_config.db_dir
+# Pinecone setup
+pinecone_api_key = os.getenv('PINECONE_API_KEY')
+pinecone_environment = os.getenv('PINECONE_ENVIRONMENT')
+pinecone_index_name = "test"
+if not pinecone_api_key:
+    raise ValueError("PINECONE_API_KEY environment variable is not set")
+if not pinecone_environment:
+    raise ValueError("PINECONE_ENVIRONMENT environment variable is not set")
 
-class RoundedButton(Button):
-    pass
+# MongoDB setup
+mongo_uri = os.getenv('MONGODB_URI')
+mongo_db_name = os.getenv('DATABASE_NAME')
+mongo_collection_name = os.getenv('COLLECTION_NAME')
+if not mongo_uri:
+    raise ValueError("MONGODB_URI environment variable is not set")
+if not mongo_db_name:
+    raise ValueError("DATABASE_NAME environment variable is not set")
+if not mongo_collection_name:
+    raise ValueError("COLLECTION_NAME environment variable is not set")
 
-class RoundedTextInput(TextInput):
-    pass
-
+# Load Kivy styles
 Builder.load_string('''
-<RoundedButton@Button>:
-    background_color: 0,0,0,0
-    background_normal: ''
-    font_name: 'Roboto'
-    color: [1, 1, 1, 1]  # White text for buttons
-    canvas.before:
-        Color:
-            rgba: (0.25, 0.5, 1, 1) if self.state == 'normal' else (0.2, 0.4, 0.9, 1)
-        RoundedRectangle:
-            pos: self.pos
-            size: self.size
-            radius: [25,]
-    canvas.after:
-        Color:
-            rgba: (1, 1, 1, 0.1)
-        Line:
-            rounded_rectangle: (self.pos[0], self.pos[1], self.size[0], self.size[1], 25)
-            width: 1.2
-
-<RoundedTextInput>:
-    background_color: [0.12, 0.12, 0.17, 1]
+<RoundedTextInput@TextInput>:
+    background_color: [0.18, 0.18, 0.23, 1]  # Same as AI message bubble
     foreground_color: [1, 1, 1, 1]  # White text
     cursor_color: [1, 1, 1, 1]  # White cursor
     padding: [25, 15]
     font_size: '16sp'
     font_name: 'Roboto'
-    hint_text_color: [0.7, 0.7, 0.7, 1]  # Lighter gray for better visibility
+    hint_text_color: [0.7, 0.7, 0.7, 1]
     selection_color: [0.25, 0.5, 1, 0.5]
     write_tab: False
+    multiline: False
     background_normal: ''
     background_active: ''
-    use_bubble: False  # Disable the bubble effect
-    use_handles: False  # Disable selection handles
+    background_disabled: ''
+    background_disabled_normal: ''
+    use_bubble: False
+    use_handles: False
     text_validate_unfocus: False
+    halign: 'left'
+    valign: 'middle'
     canvas.before:
         Clear
         Color:
-            rgba: [0.18, 0.18, 0.23, 1]
+            rgba: [0.18, 0.18, 0.23, 1]  # Same as AI message bubble
         RoundedRectangle:
             pos: self.pos
             size: self.size
-            radius: [25,]
+            radius: [15]  # Same radius as message bubbles
         Color:
-            rgba: [0.25, 0.5, 1, 0.1]
+            rgba: [0.25, 0.5, 1, 0.1]  # Subtle blue border
         Line:
-            rounded_rectangle: (self.pos[0], self.pos[1], self.size[0], self.size[1], 25)
+            rounded_rectangle: (self.pos[0], self.pos[1], self.size[0], self.size[1], 15)
             width: 1.2
 
 <Label>:
@@ -100,635 +156,510 @@ Builder.load_string('''
     font_name: 'Roboto'
 ''')
 
-
-class MessageBubble(BoxLayout):
-    def __init__(self, message, is_user=False, **kwargs):
-        super().__init__(**kwargs)
-        self.orientation = 'horizontal'
-        self.size_hint_y = None
-        self.padding = [10, 5]
-        self.spacing = 10
-        self.height = 40  # Initial height, will be adjusted
-        
-        # Create message container
-        msg_container = BoxLayout()
-        msg_container.size_hint_x = 0.8
-        msg_container.size_hint_y = None
-        msg_container.padding = [15, 10]
-        
-        with msg_container.canvas.before:
-            Color(rgba=(0.25, 0.5, 1, 1) if is_user else (0.18, 0.18, 0.23, 1))
-            self.rect = RoundedRectangle(radius=[15])
-        
-        # Message label with white text
-        msg_label = Label(
-            text=message,
-            color=[1, 1, 1, 1],  # Pure white text
-            size_hint_y=None,
-            font_size='16sp',
-            font_name='Roboto',
-            halign='left',
-            valign='middle',
-            text_size=(None, None),  # Will be set in _update_label_text_size
-            markup=True  # Enable markup for better text handling
-        )
-        
-        msg_container.bind(size=self._update_label_text_size)
-        msg_container.bind(pos=self._update_rect)
-        msg_container.bind(size=self._update_rect)
-        
-        msg_container.add_widget(msg_label)
-        
-        # Add spacing for message alignment
-        if is_user:
-            self.add_widget(BoxLayout(size_hint_x=0.2))
-        self.add_widget(msg_container)
-        if not is_user:
-            self.add_widget(BoxLayout(size_hint_x=0.2))
-        
-        # Animate the bubble appearance
-        self.opacity = 0
-        anim = Animation(opacity=1, duration=0.3)
-        anim.start(self)
-    
-    def _update_label_text_size(self, instance, value):
-        label = instance.children[0]
-        # Set text_size to enable wrapping
-        label.text_size = (instance.width - 20, None)
-        # Let the label calculate its size
-        label.texture_update()
-        # Update heights based on content
-        new_height = max(label.texture_size[1], label.line_height)
-        label.height = new_height
-        instance.height = new_height + 20  # Add padding
-        self.height = instance.height + 10  # Update bubble height
-    
-    def _update_rect(self, instance, value):
-        self.rect.pos = instance.pos
-        self.rect.size = instance.size
-
-class ChatArea(ScrollView):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.messages = GridLayout(cols=1, spacing=10, size_hint_y=None, padding=[10, 10])
-        self.messages.bind(minimum_height=self.messages.setter('height'))
-        self.add_widget(self.messages)
-    
-    def add_message(self, text, is_user=False):
-        message = MessageBubble(text, is_user=is_user)
-        self.messages.add_widget(message)
-        Clock.schedule_once(lambda dt: self.scroll_to(message), 0.1)
+# Comment out or remove this entire class
+# class RoundedTextInput(TextInput):
+#     def __init__(self, **kwargs):
+#         # ... existing code ...
 
 class QASystem:
     def __init__(self):
-        self.embeddings = OpenAIEmbeddings(
-            openai_api_key=api_key,
-            model="text-embedding-3-large"
-        )
-        self.llm = ChatOpenAI(
-            model="gpt-4",
-            temperature=0.7,
-            openai_api_key=api_key
-        )
-        self.current_db = None
-        self.qa_chain = None
-        self.current_vectorstore = None
-
-    def load_database(self, db_name):
+        self.initialize()
+        
+    def initialize(self):
         try:
-            # Construct the full database path
-            full_db_path = os.path.join(VECTOR_DB_DIR, db_name)
-            print(f"Full database path: {full_db_path}")
-            
-            if not os.path.exists(full_db_path):
-                raise FileNotFoundError(f"Database path not found: {full_db_path}")
-            
-            self.current_vectorstore = Chroma(
-                persist_directory=full_db_path,
-                embedding_function=self.embeddings
+            # Initialize OpenAI components with error handling
+            self.embeddings = OpenAIEmbeddings(
+                openai_api_key=api_key,
+                model="text-embedding-3-large"
+            )
+            self.llm = ChatOpenAI(
+                model="gpt-4o-mini",  # Updated to latest model
+                temperature=0.7,
+                openai_api_key=api_key
             )
             
-            # Create the prompt template with better context handling
-            custom_template = """
-            You are a knowledgeable AI assistant. Use ONLY the following context and chat history to answer the question. 
-            If you cannot find the answer in the context, say so clearly.
-
-            Context: {context}
-
-            Chat History: {chat_history}
-
-            Current Question: {question}
-
-            Assistant: Let me help you with that based on the provided context.
-            """
+            # Force reload of environment variables to get the latest database selection
+            from dotenv import load_dotenv
+            load_dotenv(override=True)
             
-            PROMPT = PromptTemplate(
-                input_variables=["context", "chat_history", "question"],
-                template=custom_template
-            )
+            # Get the active Pinecone index URL from environment
+            # First check if a database was selected in the UI
+            pinecone_index_url = os.getenv('ACTIVE_PINECONE_INDEX_URL')
             
-            self.qa_chain = ConversationalRetrievalChain.from_llm(
-                llm=self.llm,
-                retriever=self.current_vectorstore.as_retriever(search_kwargs={"k": 4}),
-                return_source_documents=True,
-                combine_docs_chain_kwargs={"prompt": PROMPT}
-            )
-            
-            self.current_db = db_name
-            return True
-        except Exception as e:
-            print(f"Error loading database: {str(e)}")
-            return False
-
-    def get_available_databases(self):
-        try:
-            # Normalize the path to ensure consistent format
-            db_path = os.path.normpath(VECTOR_DB_DIR)
-            if not os.path.exists(db_path):
-                print(f"Vector DB directory not found: {db_path}")
-                return []
-            
-            databases = [d for d in os.listdir(db_path) 
-                        if os.path.isdir(os.path.join(db_path, d))]
-            print(f"Found databases: {databases}")
-            return databases
-        except Exception as e:
-            print(f"Error accessing database directory: {str(e)}")
-            return []
-
-# Initialize QA system
-qa_system = QASystem()
-
-class LoginScreen(Screen):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        layout = FloatLayout()
-        
-        # Title label
-        title_label = Label(
-            text="BlackPod AI",
-            font_size='24sp',
-            color=[1, 1, 1, 1],
-            pos_hint={'center_x': 0.5, 'center_y': 0.85},
-            size_hint=(0.8, 0.1)
-        )
-        
-        # Username input
-        self.username = TextInput(
-            hint_text='Username',
-            size_hint=(0.8, None),
-            height=50,
-            pos_hint={'center_x': 0.5, 'center_y': 0.65},
-            foreground_color=[1, 1, 1, 1],
-            hint_text_color=[0.7, 0.7, 0.7, 1],
-            background_color=[0.12, 0.12, 0.17, 1],
-            cursor_color=[1, 1, 1, 1],
-            background_normal='',
-            background_active='',
-            multiline=False,
-            write_tab=False,
-            padding=[25, 15],
-            font_name='Roboto',
-            font_size='16sp'
-        )
-        
-        # Password input
-        self.password = TextInput(
-            hint_text='Password',
-            password=True,
-            size_hint=(0.8, None),
-            height=50,
-            pos_hint={'center_x': 0.5, 'center_y': 0.55},
-            foreground_color=[1, 1, 1, 1],
-            hint_text_color=[0.7, 0.7, 0.7, 1],
-            background_color=[0.12, 0.12, 0.17, 1],
-            cursor_color=[1, 1, 1, 1],
-            background_normal='',
-            background_active='',
-            multiline=False,
-            write_tab=False,
-            padding=[25, 15],
-            font_name='Roboto',
-            font_size='16sp'
-        )
-
-        # Organization Key input
-        self.org_key = TextInput(
-            hint_text='Organization Key',
-            size_hint=(0.8, None),
-            height=50,
-            pos_hint={'center_x': 0.5, 'center_y': 0.45},
-            foreground_color=[1, 1, 1, 1],
-            hint_text_color=[0.7, 0.7, 0.7, 1],
-            background_color=[0.12, 0.12, 0.17, 1],
-            cursor_color=[1, 1, 1, 1],
-            background_normal='',
-            background_active='',
-            multiline=False,
-            write_tab=False,
-            padding=[25, 15],
-            font_name='Roboto',
-            font_size='16sp'
-        )
-        
-        # Login button
-        login_btn = RoundedButton(
-            text='Login',
-            size_hint=(0.8, None),
-            height=50,
-            pos_hint={'center_x': 0.5, 'center_y': 0.35},
-            color=[1, 1, 1, 1]
-        )
-        login_btn.bind(on_release=self.attempt_login)
-        
-        # Add widgets to layout in correct order
-        layout.add_widget(title_label)
-        layout.add_widget(self.username)
-        layout.add_widget(self.password)
-        layout.add_widget(self.org_key)
-        layout.add_widget(login_btn)
-        
-        # Add layout to screen
-        self.add_widget(layout)
-    
-    def attempt_login(self, instance):
-        username = self.username.text.strip()
-        password = self.password.text.strip()
-        org_key = self.org_key.text.strip()
-        
-        # Basic validation
-        if not all([username, password, org_key]):
-            self.show_error("Please fill in all fields")
-            return
-        
-        # Use the actual authentication logic
-        user_manager = UserManager()
-        result = user_manager.login(username, password, org_key)
-        
-        if "Login successful" in result:
-            # Store the organization key and try to load the corresponding database
-            App.get_running_app().org_key = org_key
-            
-            # First check if the database exists
-            if os.path.exists(os.path.join(VECTOR_DB_DIR, org_key)):
-                if qa_system.load_database(org_key):
-                    self.manager.current = 'chat'
-                else:
-                    self.show_error("Error loading database. Please try again.")
-            else:
-                self.show_error(f"No database found for organization key: {org_key}")
-        else:
-            self.show_error(result)
-    
-    def show_error(self, message):
-        content = Label(
-            text=message,
-            color=[1, 0, 0, 1],  # Red for errors
-            font_size='16sp'
-        )
-        popup = Popup(
-            title='Error',
-            content=content,
-            size_hint=(0.8, 0.2),
-            title_color=[1, 1, 1, 1],  # White title
-            title_size='18sp',
-            background_color=[0.18, 0.18, 0.23, 1]  # Dark background
-        )
-        popup.open()
-
-class DatabaseSelectScreen(Screen):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        # Main layout with padding
-        layout = BoxLayout(orientation='vertical', padding=[25, 40, 25, 25], spacing=30)
-        
-        # Header area with title and description
-        header_layout = BoxLayout(orientation='vertical', spacing=10, size_hint_y=None, height=100)
-        
-        # Title with larger font
-        title = Label(
-            text="Select Database",
-            font_size='28sp',
-            color=[1, 1, 1, 1],
-            bold=True,
-            size_hint_y=None,
-            height=50
-        )
-        
-        # Description text
-        description = Label(
-            text="Choose a database to start chatting",
-            font_size='16sp',
-            color=[0.7, 0.7, 0.7, 1],
-            size_hint_y=None,
-            height=30
-        )
-        
-        header_layout.add_widget(title)
-        header_layout.add_widget(description)
-        
-        # Add header to main layout
-        layout.add_widget(header_layout)
-        
-        # Spacer
-        layout.add_widget(Widget(size_hint_y=0.1))
-        
-        # Database selection area
-        selection_layout = BoxLayout(orientation='vertical', spacing=15, size_hint_y=None, height=150)
-        
-        # Main button that will show the dropdown
-        self.main_button = RoundedButton(
-            text='Select Database',
-            size_hint=(1, None),
-            height=50,
-            background_color=[0.25, 0.5, 1, 1]  # Blue color
-        )
-        
-        # Create the dropdown with custom styling
-        self.dropdown = DropDown(
-            auto_width=False,
-            size_hint_x=1,  # Make dropdown same width as button
-        )
-        
-        # Add canvas instructions to style the dropdown background
-        with self.dropdown.canvas.before:
-            Color(rgba=(0.12, 0.12, 0.17, 0.95))  # Dark background with slight transparency
-            self.dropdown.rect = RoundedRectangle(size=self.dropdown.size, pos=self.dropdown.pos, radius=[15])
-        
-        # Bind dropdown size and position updates
-        self.dropdown.bind(size=self._update_dropdown_rect, pos=self._update_dropdown_rect)
-        
-        # Status label with white text
-        self.status_label = Label(
-            text="No database selected",
-            color=[0.7, 0.7, 0.7, 1],  # Light gray for status
-            size_hint_y=None,
-            height=30,
-            font_size='14sp'
-        )
-        
-        selection_layout.add_widget(self.main_button)
-        selection_layout.add_widget(self.status_label)
-        
-        # Add selection area to main layout
-        layout.add_widget(selection_layout)
-        
-        # Spacer
-        layout.add_widget(Widget(size_hint_y=0.2))
-        
-        # Continue button at the bottom
-        continue_btn = RoundedButton(
-            text='Continue',
-            size_hint=(1, None),
-            height=50,
-            background_color=[0.25, 0.5, 1, 1]  # Blue color
-        )
-        continue_btn.bind(on_release=self.proceed_to_chat)
-        
-        # Add continue button to main layout
-        layout.add_widget(continue_btn)
-        
-        # Load databases and bind dropdown
-        self.load_databases()
-        self.main_button.bind(on_release=self.dropdown.open)
-        
-        # Add the main layout to the screen
-        self.add_widget(layout)
-    
-    def _update_dropdown_rect(self, instance, value):
-        """Update the dropdown background rectangle"""
-        instance.rect.size = instance.size
-        instance.rect.pos = instance.pos
-    
-    def load_databases(self):
-        # Get the organization key from the app instance
-        org_key = App.get_running_app().org_key
-        
-        # Get all databases
-        databases = qa_system.get_available_databases()
-        
-        # Handle case where org_key is not set
-        if not org_key:
-            self.status_label.text = "Please log in first"
-            return
-        
-        # Filter databases based on organization key
-        filtered_databases = [db for db in databases if db.startswith(org_key)]
-        
-        if filtered_databases:
-            for db in filtered_databases:
-                # Create a custom styled button for each database
-                btn = Button(
-                    text=db,
-                    size_hint_y=None,
-                    height=45,
-                    background_color=[0, 0, 0, 0],  # Transparent background
-                    background_normal='',
-                    background_down='',
-                    color=[1, 1, 1, 1],  # White text
-                    font_size='16sp'
-                )
+            # Fall back to the main PINECONE_INDEX_URL if no selection was made
+            if not pinecone_index_url:
+                pinecone_index_url = os.getenv('PINECONE_INDEX_URL')
                 
-                # Add hover effect
-                btn.bind(
-                    on_release=lambda btn: self.select_database(btn.text)
-                )
-                self.dropdown.add_widget(btn)
-            self.status_label.text = f"Found {len(filtered_databases)} databases for your organization"
-        else:
-            self.status_label.text = "No databases available for your organization"
-    
-    def _update_btn_rect(self, instance, value):
-        """Update the button background rectangle"""
-        instance.rect.size = instance.size
-        instance.rect.pos = instance.pos
-    
-    def _update_btn_state(self, instance, value):
-        """Update button appearance based on state"""
-        if value == 'down':
-            instance.bg_color.rgba = (0.25, 0.5, 1, 1)  # Blue when pressed
-        else:
-            instance.bg_color.rgba = (0.18, 0.18, 0.23, 1)  # Default dark background
-    
-    def select_database(self, db_name):
-        try:
-            selected_db = os.path.normpath(os.path.join(VECTOR_DB_DIR, db_name))
-            print(f"Attempting to load database from: {selected_db}")
+            if not pinecone_index_url:
+                raise ValueError("No Pinecone index URL available. Please select a database.")
             
-            if qa_system.load_database(selected_db):
-                self.selected_db = selected_db
-                self.main_button.text = db_name
-                self.status_label.text = f"Selected: {db_name}"
-                self.status_label.color = [0.3, 0.8, 0.3, 1]  # Green for success
-                print(f"Successfully loaded database: {db_name}")
-            else:
-                self.status_label.text = f"Failed to load: {db_name}"
-                self.status_label.color = [0.8, 0.3, 0.3, 1]  # Red for failure
-                print(f"Failed to load database: {db_name}")
-            self.dropdown.dismiss()
+            logging.info(f"Using Pinecone index URL: {pinecone_index_url}")
+            
+            # Completely new Pinecone connection for each initialization
+            if hasattr(self, 'pc') and self.pc is not None:
+                try:
+                    # Try to clean up old connection
+                    del self.pc
+                except:
+                    pass
+                    
+            self.pc = Pinecone(api_key=pinecone_api_key)
+            self.index = self.pc.Index(
+                name=pinecone_index_name,
+                host=pinecone_index_url.split('https://')[1]  # Extract host from URL
+            )
+            
+            # Configure vector store with optimized settings - with no caching
+            self.vectorstore = PineconeVectorStore(
+                index=self.index,
+                embedding=self.embeddings,
+                text_key="extra_key_data",  # Specify text key for metadata
+                namespace=""  # Use default namespace
+            )
+            
+            # Initialize chat history
+            self.chat_history = []
+            
+            logging.info(f"Successfully initialized QA System with Pinecone URL: {pinecone_index_url}")
+            self.current_db_url = pinecone_index_url
         except Exception as e:
-            self.status_label.text = f"Error: {str(e)}"
-            self.status_label.color = [0.8, 0.3, 0.3, 1]  # Red for error
-            print(f"Error selecting database: {str(e)}")
-            self.dropdown.dismiss()
-    
-    def proceed_to_chat(self, instance):
-        if hasattr(self, 'selected_db'):
-            self.manager.current = 'chat'
-        else:
-            self.show_error("Please select a database first")
-    
-    def show_error(self, message):
-        content = BoxLayout(orientation='vertical', padding=[20, 10])
-        content.add_widget(Label(
-            text=message,
-            color=[1, 0.3, 0.3, 1],  # Light red for errors
-            font_size='16sp'
-        ))
-        popup = Popup(
-            title='Error',
-            content=content,
-            size_hint=(0.8, 0.3),
-            title_color=[1, 1, 1, 1],  # White title
-            title_size='18sp',
-            background_color=[0.18, 0.18, 0.23, 1]  # Dark background
-        )
-        popup.open()
+            logging.error(f"Error initializing QA System: {str(e)}")
+            raise
+        
+        # Generic prompt template that can adapt to different contexts
+        template = """
+        You are a versatile AI assistant that adapts to different roles based on the context provided. You provide helpful, accurate, and relevant information based on the documents and context available to you.
 
+        Here is the relevant information from the knowledge base:
+        {context}
+
+        Previous conversation:
+        {chat_history}
+
+        Current Question: {question}
+
+        Instructions:
+        1. Analyze the context to understand what domain or topic the user is asking about
+        2. Provide accurate information based on the context provided
+        3. Explain complex concepts in clear, easy-to-understand language
+        4. If the context suggests a specific role (e.g., mortgage advisor, tech support, etc.), adopt that role appropriately
+        5. Maintain a helpful, professional, and informative tone
+        6. When appropriate, ask clarifying questions to provide better guidance
+        7. If you don't have enough information to provide a specific answer, offer general guidance based on the available context
+        8. Stay focused on the user's question and the relevant context
+        """
+        
+        QA_CHAIN_PROMPT = PromptTemplate(
+            input_variables=["context", "chat_history", "question"],
+            template=template
+        )
+        
+        self.qa_chain = ConversationalRetrievalChain.from_llm(
+            llm=self.llm,
+            retriever=self.vectorstore.as_retriever(search_kwargs={"k": 4}),
+            return_source_documents=True,
+            combine_docs_chain_kwargs={"prompt": QA_CHAIN_PROMPT}
+        )
+        logging.info("QA System initialized with OpenAI models and Pinecone")
+
+    def reinitialize(self):
+        """Force a complete reinitialization of the QA system"""
+        logging.info("Reinitializing QA System with fresh database connection")
+        self.initialize()
+        return self
+
+    def get_response(self, query, chat_history):
+        try:
+            # Log which database URL we're using for this query
+            pinecone_index_url = os.getenv('ACTIVE_PINECONE_INDEX_URL') or os.getenv('PINECONE_INDEX_URL')
+            logging.info(f"Processing query with database URL: {pinecone_index_url}")
+            
+            # Get relevant documents with search
+            docs = self.vectorstore.similarity_search_with_score(
+                query,
+                k=4  # Number of documents to retrieve
+            )
+            
+            if not docs:
+                return "I couldn't find any relevant information to answer your question."
+            
+            # Log documents retrieved
+            logging.info(f"Retrieved {len(docs)} documents from database")
+            for i, (doc, score) in enumerate(docs):
+                doc_id = doc.metadata.get('id', 'N/A')
+                doc_source = doc.metadata.get('source', 'Unknown')
+                logging.info(f"Doc {i+1}: ID={doc_id}, Source={doc_source}, Score={score}, Content preview: {doc.page_content[:50]}...")
+            
+            doc_contents = []
+            for doc, score in docs:
+                # Enhanced metadata processing
+                doc_info = {
+                    "id": doc.metadata.get('id', 'N/A'),
+                    "content": doc.page_content,
+                    "metadata": {
+                        "source": doc.metadata.get('source', 'Unknown'),
+                        "document_type": doc.metadata.get('document_type', 'Unknown'),
+                        "created_at": doc.metadata.get('created_at', 'Unknown')
+                    },
+                    "relevance_score": float(score)
+                }
+                doc_contents.append(doc_info)
+            
+            # Sort documents by relevance score
+            doc_contents.sort(key=lambda x: x['relevance_score'], reverse=True)
+            
+            # Format context with enhanced structure
+            formatted_context = "\n\n".join([
+                f"Document {i+1} (Relevance: {doc['relevance_score']:.2f}):\n" +
+                f"Content: {doc['content']}\n" +
+                f"Source: {doc['metadata']['source']}\n" +
+                f"Type: {doc['metadata']['document_type']}"
+                for i, doc in enumerate(doc_contents)
+            ])
+            
+            # Format chat history with clear separation
+            formatted_chat_history = "\n---\n".join([
+                f"User: {q}\nAssistant: {a}" 
+                for q, a in chat_history
+            ])
+            
+            # Get response with enhanced context handling
+            response = self.qa_chain.invoke({
+                "question": query,
+                "chat_history": chat_history,
+                "context": formatted_context
+            })
+            
+            answer = response.get('answer')
+            if not answer:
+                return "I apologize, but I couldn't generate a proper response based on the available information."
+            
+            logging.info(f"Successfully generated response for query: {query}")
+            return answer
+            
+        except Exception as e:
+            logging.error(f"Error in get_response: {str(e)}", exc_info=True)
+            return f"I apologize, but I encountered an error while processing your request. Please try again or rephrase your question."
+
+# Update ChatScreen class
 class ChatScreen(Screen):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.layout = BoxLayout(orientation='vertical', padding=25, spacing=20)
         
-        # Chat area
-        self.chat_area = ChatArea(size_hint=(1, 1))
-        self.layout.add_widget(self.chat_area)
-        
-        # Input area with explicit style overrides - using same config as login fields
-        self.user_input = TextInput(
-            hint_text='Type your request...',
-            size_hint_y=None,
-            height=50,
-            foreground_color=[1, 1, 1, 1],  # White text
-            hint_text_color=[0.7, 0.7, 0.7, 1],
-            background_color=[0.12, 0.12, 0.17, 1],
-            cursor_color=[1, 1, 1, 1],
-            background_normal='',
-            background_active='',
-            multiline=False,
-            write_tab=False,
-            padding=[25, 15],
-            font_name='Roboto',
-            font_size='16sp',
-            use_bubble=False,  # Disable the bubble effect
-            use_handles=False  # Disable selection handles
-        )
-        self.user_input.bind(on_text_validate=self.on_text_submit)
-        self.layout.add_widget(self.user_input)
-        
-        # Initialize chat history as list of tuples (question, answer)
-        self.chat_history = []
-        
-        # Add a loading indicator
-        self.loading_label = Label(
-            text="Processing...",
-            color=[0.7, 0.7, 0.7, 1],
-            size_hint_y=None,
-            height=30,
-            opacity=0
-        )
-        self.layout.add_widget(self.loading_label)
-        
+        # Set up the screen
+        self.name = 'chat'
+        self.layout = BoxLayout(orientation='vertical')
         self.add_widget(self.layout)
-    
-    def show_loading(self, show=True):
-        self.loading_label.opacity = 1 if show else 0
-        self.user_input.disabled = show
-    
-    def process_chat_in_thread(self, user_message):
-        try:
-            # Format chat history for the chain
-            formatted_history = [(q, a) for q, a in self.chat_history]
-            
-            # Get response from QA system with chat history
-            response = qa_system.qa_chain.invoke({
-                "question": user_message,
-                "chat_history": formatted_history
-            })
-            
-            # Extract answer and source documents
-            bot_message = response.get('answer', "I couldn't generate a response.")
-                
-            # Add source attribution if available
-            source_docs = response.get('source_documents', [])
-            if source_docs:
-                sources = "\n\nSources:"
-                for i, doc in enumerate(source_docs, 1):
-                    if hasattr(doc, 'metadata') and 'source' in doc.metadata:
-                        sources += f"\n{i}. {doc.metadata['source']}"
-            
-            # Update chat history with the new exchange
-            self.chat_history.append((user_message, bot_message))
-            
-            # Limit chat history to last 10 exchanges to prevent context overflow
-            if len(self.chat_history) > 10:
-                self.chat_history = self.chat_history[-10:]
-            
-            # Schedule the UI update on the main thread
-            Clock.schedule_once(lambda dt: self.update_chat_ui(bot_message), 0)
-            
-        except Exception as e:
-            bot_message = "I apologize, but I encountered an error processing your request. Please try again."
-            print(f"Error in chat: {str(e)}")
-            Clock.schedule_once(lambda dt: self.update_chat_ui(bot_message), 0)
         
-        finally:
-            # Hide loading indicator
-            Clock.schedule_once(lambda dt: self.show_loading(False), 0)
-    
-    def update_chat_ui(self, bot_message):
-        self.chat_area.add_message(bot_message, is_user=False)
-    
-    def on_text_submit(self, instance):
-        user_message = instance.text.strip()
-        if user_message:
-            # Clear input
-            instance.text = ''
-            
-            # Add user message to chat
-            self.chat_area.add_message(user_message, is_user=True)
-            
-            # Show loading indicator
-            self.show_loading(True)
-            
-            if not qa_system.current_db:
-                self.chat_area.add_message("Please select a database first!", is_user=False)
-                self.show_loading(False)
-                return
-            
-            # Process chat in background thread
-            Thread(
-                target=self.process_chat_in_thread,
-                args=(user_message,),
-                daemon=True
-            ).start()
+        # Updated back button configuration
+        back_button = RoundedButton(
+            text='Back',  # Changed from arrow symbol
+            size_hint=(0.15, 1),  # Match send button proportions
+            background_color=[0.25, 0.5, 1, 1],  # Same blue as send button
+            pos_hint={'left': 0.05, 'y': 0.05}  # Positioned at top left
+        )
+        back_button.bind(on_release=self.go_back)
+        
+        # Create a relative layout for the back button
+        top_bar = RelativeLayout(size_hint=(1, 0.1))
+        top_bar.add_widget(back_button)
+        self.layout.add_widget(top_bar)
+        
+        # Initialize chat components
+        self.chat_area = ChatArea(size_hint=(1, 0.85))  # Reduced to give more space to input
+        
+        # Create input area with proper styling
+        self.input_area = BoxLayout(
+            size_hint=(1, 0.15),  # Increased height 
+            spacing=10,
+            padding=[15, 10, 15, 10],  # Left, top, right, bottom padding
+            orientation='horizontal',
+            height=70  # Set a minimum height
+        )
+        
+        # Message input - updated to match login screen style
+        self.message_input = TextInput(
+            hint_text='Type your message...',
+            multiline=False,
+            size_hint=(0.85, 1),
+            height=50,
+            padding=[10, 15],  # Matches login field padding
+            background_color=(0.12, 0.12, 0.17, 1),  # Same dark blue
+            foreground_color=(1, 1, 1, 1),  # White text
+            cursor_color=(1, 1, 1, 1),  # White cursor
+            font_size='16sp',
+            cursor_width=2,
+            background_normal='',  # Remove default background
+            background_active='',  # Remove active state background
+            write_tab=False  # Prevent tab characters
+        )
+        self.message_input.bind(on_text_validate=self.send_message)
+        
+        # Send button with matching style
+        self.send_button = RoundedButton(
+            text='Send',
+            size_hint=(0.15, 1),
+            background_color=[0.25, 0.5, 1, 1]  # Blue color for send button
+        )
+        self.send_button.bind(on_release=self.send_message)
+        
+        # Add components to layout with proper spacing
+        input_container = BoxLayout(
+            size_hint=(1, 1),
+            spacing=15,
+            padding=[10, 10],
+            height=60,  # Set a minimum height
+            minimum_height=60  # Ensure minimum height is respected
+        )
+        input_container.add_widget(self.message_input)
+        input_container.add_widget(self.send_button)
+        
+        self.input_area.add_widget(input_container)
+        self.layout.add_widget(self.chat_area)
+        self.layout.add_widget(self.input_area)
+        
+        # Initialize chat history and lock
+        self.chat_history = []
+        self._lock = threading.Lock()
+        
+        # Bind to on_enter event to focus the text input when the screen is shown
+        self.bind(on_enter=self._on_enter)
+        
+    def _on_enter(self, instance):
+        # Focus the text input when the screen is shown
+        Clock.schedule_once(lambda dt: self._focus_text_input(), 0.5)
+        
+    def _focus_text_input(self):
+        # Focus the text input
+        self.message_input.focus = True
 
-class ChatBotApp(App):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.org_key = None  # Initialize org_key
-        self.sm = ScreenManager()
+    def go_back(self, instance):
+        """Navigate back to the database select screen"""
+        self.manager.current = 'database_select'
+        # Clear chat history when going back
+        self.chat_history = []
+        self.chat_area.messages.clear_widgets()
 
+    def send_message(self, instance):
+        user_message = self.message_input.text.strip()
+        if not user_message:
+            return
+
+        # Immediately add user message and clear input
+        self.chat_area.add_message(user_message, is_user=True)
+        self.message_input.text = ''
+        
+        def get_ai_response():
+            # Show typing indicator only when starting to process
+            def show_typing(dt):
+                self.typing_label = self.chat_area.add_message("AI is thinking...", is_user=False)
+            Clock.schedule_once(show_typing)
+            
+            try:
+                # Get the app instance to access the QASystem
+                app = App.get_running_app()
+                
+                # Get current active database URL
+                active_url = os.getenv('ACTIVE_PINECONE_INDEX_URL') or os.getenv('PINECONE_INDEX_URL')
+                
+                # Check if QA system exists - if not, create it
+                if not hasattr(app, 'qa_system') or app.qa_system is None:
+                    # Create a new QA system
+                    logging.info("Creating new QA system instance")
+                    try:
+                        app.qa_system = QASystem()
+                        logging.info(f"Created new QA system with URL: {app.qa_system.current_db_url}")
+                    except Exception as e:
+                        logging.error(f"Error creating QA system: {str(e)}")
+                        raise
+                # Check if we need to reinitialize due to database change
+                elif hasattr(app.qa_system, 'current_db_url') and app.qa_system.current_db_url != active_url:
+                    logging.info(f"Database URL changed from {app.qa_system.current_db_url} to {active_url}, reinitializing")
+                    app.qa_system.reinitialize()
+                
+                # Log which database we're using
+                logging.info(f"Getting response using database URL: {active_url}")
+                
+                # Get AI response in background thread
+                response = app.qa_system.get_response(user_message, self.chat_history)
+                
+                # Schedule UI update on main thread
+                def update_ui(dt):
+                    with self._lock:
+                        # First remove typing indicator
+                        if hasattr(self, 'typing_label') and self.typing_label in self.chat_area.messages.children:
+                            self.chat_area.messages.remove_widget(self.typing_label)
+                            self.chat_area.messages.do_layout()
+                            delattr(self, 'typing_label')
+                        
+                        # Add the AI response after a small delay to ensure clean transition
+                        def add_response(dt):
+                            self.chat_area.add_message(response, is_user=False)
+                            self.chat_history.append((user_message, response))
+                        Clock.schedule_once(add_response, 0.1)
+                
+                Clock.schedule_once(update_ui)
+                
+            except Exception as e:
+                def show_error(dt):
+                    with self._lock:
+                        # Remove typing indicator if it exists
+                        if hasattr(self, 'typing_label') and self.typing_label in self.chat_area.messages.children:
+                            self.chat_area.messages.remove_widget(self.typing_label)
+                            self.chat_area.messages.do_layout()
+                            delattr(self, 'typing_label')
+                        error_message = f"Error: {str(e)}"
+                        self.chat_area.add_message(error_message, is_user=False)
+                        logging.error(f"Error in send_message: {str(e)}")
+                
+                Clock.schedule_once(show_error)
+
+        # Start processing in a background thread
+        threading.Thread(target=get_ai_response, daemon=True).start()
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+class BlackPodAIApp(App):
     def build(self):
-        # Add screens to the screen manager
-        self.sm.add_widget(LoginScreen(name='login'))
-        self.sm.add_widget(DatabaseSelectScreen(name='database_select'))
-        self.sm.add_widget(ChatScreen(name='chat'))
-        return self.sm
+        try:
+            # Set window properties
+            Window.size = (400, 700)
+            Window.clearcolor = (0.08, 0.08, 0.12, 1)  # Dark background
+            
+            # Create QA system for chat functionality
+            try:
+                self.qa_system = QASystem()
+                logging.info("QA System initialized successfully")
+            except Exception as e:
+                logging.error(f"Error initializing QA System: {e}")
+                logging.error(traceback.format_exc())
+                # Create a placeholder - will be initialized when database is selected
+                self.qa_system = None
+            
+            # Create screen manager
+            self.sm = ScreenManager()
+            
+            # Add screens with error handling
+            try:
+                login_screen = LoginScreen(name='login')
+                self.sm.add_widget(login_screen)
+                
+                database_select = DatabaseSelectScreen(name='database_select')
+                self.sm.add_widget(database_select)
+                
+                chat_screen = ChatScreen(name='chat')
+                self.sm.add_widget(chat_screen)
+                
+                self.sm.current = 'login'
+                logging.info("All screens added successfully")
+            except Exception as e:
+                logging.error(f"Error adding screens: {e}")
+                logging.error(traceback.format_exc())
+                raise
+            
+            # Start FastAPI server with better error handling
+            try:
+                api_script = resource_path("api_server.py")
+                logging.info(f"Starting API server from: {api_script}")
+                self.api_process = subprocess.Popen(
+                    [sys.executable, api_script],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                logging.info("API server started successfully")
+            except Exception as e:
+                logging.error(f"Error starting API server: {e}")
+                logging.error(traceback.format_exc())
+                # Continue without API server
+                self.api_process = None
+            
+            return self.sm
+        except Exception as e:
+            logging.error(f"Error in build method: {e}")
+            logging.error(traceback.format_exc())
+            raise
 
-    # Update this when loading databases
-    def update_status(self, text):
-        self.status_label.text = text
+    def on_stop(self):
+        try:
+            if hasattr(self, 'api_process') and self.api_process:
+                logging.info("Terminating API process")
+                self.api_process.terminate()
+        except Exception as e:
+            logging.error(f"Error in on_stop: {e}")
+
+# --- Single Instance Lock --- (Cross-platform implementation)
+lock_file_path = os.path.join(os.environ.get("TEMP", "/tmp"), "BlackPodAI.lock")
+lock_file = None
+mutex = None
+
+def is_already_running():
+    global lock_file, mutex
+    
+    # Windows implementation using mutex
+    if os.name == 'nt':
+        mutex_name = "Global\\BlackPodAI_SingleInstance"
+        try:
+            logging.info(f"Creating Windows mutex: {mutex_name}")
+            mutex = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
+            last_error = ctypes.windll.kernel32.GetLastError()
+            if last_error == 183:  # ERROR_ALREADY_EXISTS
+                logging.warning("Windows mutex already exists. Application is already running.")
+                return True
+            logging.info("Windows mutex created successfully.")
+            return False
+        except Exception as e:
+            logging.error(f"Exception during Windows mutex creation: {e}")
+            return False  # Allow running on error to prevent lockout
+    
+    # Unix implementation using fcntl
+    else:
+        logging.info(f"Attempting to create lock file at: {lock_file_path}")
+        try:
+            lock_file = open(lock_file_path, "w")
+            logging.info(f"Lock file opened successfully: {lock_file_path}")
+            fcntl.lockf(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            logging.info("Lock acquired successfully.")
+            return False  # No lock, so not already running
+        except BlockingIOError:
+            logging.warning("BlockingIOError: Lock already exists. Application is already running.")
+            return True   # Lock exists, already running
+        except Exception as e:
+            logging.error(f"Exception during lock attempt: {e}")
+            return False  # Allow running on error to prevent lockout
+
+def cleanup_locks():
+    global lock_file, mutex
+    if os.name == 'nt' and mutex:
+        logging.info("Closing Windows mutex")
+        ctypes.windll.kernel32.CloseHandle(mutex)
+    elif lock_file:
+        logging.info(f"Closing and removing lock file: {lock_file_path}")
+        try:
+            fcntl.lockf(lock_file, fcntl.LOCK_UN)
+            lock_file.close()
+            os.unlink(lock_file_path)
+        except Exception as e:
+            logging.error(f"Error cleaning up lock file: {e}")
 
 if __name__ == '__main__':
-    ChatBotApp().run()
+    # Only check for running instances when launched directly, not when imported
+    logging.info("Checking if application is already running...")
+    if is_already_running():
+        logging.warning("Another instance of BlackPodAI is already running. Exiting.")
+        print("Another instance of BlackPodAI is already running. Exiting.")
+        sys.exit(0)
+    
+    try:
+        BlackPodAIApp().run()
+    finally:
+        cleanup_locks()
+else:
+    # This code runs when the module is imported by another module
+    logging.info("desktop_app.py imported as a module")
